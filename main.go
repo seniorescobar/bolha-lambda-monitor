@@ -40,8 +40,6 @@ type BolhaItem struct {
 	AdUploadedId int64
 	AdUploadedAt string
 
-	UserUsername  string
-	UserPassword  string
 	UserSessionId string
 
 	ReuploadHours int
@@ -63,15 +61,7 @@ func Handler(ctx context.Context) error {
 
 	for _, bItem := range bItems {
 		// create new client
-		var (
-			c   *client.Client
-			err error
-		)
-		if bItem.UserSessionId != "" {
-			c, err = client.NewWithSessionId(bItem.UserSessionId)
-		} else {
-			c, err = client.New(&client.User{bItem.UserUsername, bItem.UserPassword})
-		}
+		c, err := client.NewWithSessionId(bItem.UserSessionId)
 		if err != nil {
 			return err
 		}
