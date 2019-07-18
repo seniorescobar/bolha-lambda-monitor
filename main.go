@@ -48,14 +48,6 @@ type BolhaItem struct {
 	ReuploadOrder int
 }
 
-type Ad struct {
-	Title       string   `json:"title"`
-	Description string   `json:"description"`
-	Price       int      `json:"price"`
-	CategoryId  int      `json:"category-id"`
-	Images      []string `json:"images"`
-}
-
 func Handler(ctx context.Context) error {
 	sess := session.Must(session.NewSession())
 
@@ -101,17 +93,28 @@ func Handler(ctx context.Context) error {
 			// reupload ad = remove + upload
 
 			// remove ad
-			if err := removeAd(c, bItem.AdUploadedId); err != nil {
+			if err := c.RemoveAd(bItem.AdUploadedId); err != nil {
 				return err
 			}
 
+			// download s3 images
+			images := make([]io.Reader, len(bItem.AdImages))
+			for i, imgPath := range bItem.AdImages {
+				img, err := downloadS3Image(imgPath)
+				if err != nil {
+					return err
+				}
+
+				images[i] = img
+			}
+
 			// upload ad
-			newUploadedId, err := uploadAd(c, &Ad{
+			newUploadedId, err := c.UploadAd(&client.Ad{
 				Title:       bItem.AdTitle,
 				Description: bItem.AdDescription,
 				Price:       bItem.AdPrice,
 				CategoryId:  bItem.AdCategoryId,
-				Images:      bItem.AdImages,
+				Images:      images,
 			})
 			if err != nil {
 				return err
@@ -133,34 +136,6 @@ func checkOrder(currOrder, allowedOrder int) bool {
 
 func checkTimeDiff(currUploadedAt time.Time, allowedHours int) bool {
 	return time.Since(currUploadedAt) > time.Duration(allowedHours)*time.Hour
-}
-
-// CLIENT
-
-func uploadAd(c *client.Client, ad *Ad) (int64, error) {
-	// download s3 images
-	images := make([]io.Reader, len(ad.Images))
-	for i, imgPath := range ad.Images {
-		img, err := downloadS3Image(imgPath)
-		if err != nil {
-			return 0, err
-		}
-
-		images[i] = img
-	}
-
-	// upload ad
-	return c.UploadAd(&client.Ad{
-		Title:       ad.Title,
-		Description: ad.Description,
-		Price:       ad.Price,
-		CategoryId:  ad.CategoryId,
-		Images:      images,
-	})
-}
-
-func removeAd(c *client.Client, uploadedAdId int64) error {
-	return c.RemoveAd(uploadedAdId)
 }
 
 // DYNAMODB
