@@ -12,7 +12,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
-	"github.com/aws/aws-sdk-go/service/dynamodb/expression"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/seniorescobar/bolha/client"
@@ -66,82 +65,72 @@ func Handler(ctx context.Context) error {
 			return err
 		}
 
-		// get active (uploaded) ad
-		activeAd, err := c.GetActiveAd(bItem.AdUploadedId)
-		if err != nil {
-			return err
-		}
-
-		// parse ad uploaded at
-		adUploadedAt, err := time.Parse(time.RFC3339, bItem.AdUploadedAt)
-		if err != nil {
-			return err
-		}
-
-		// check re-upload condition
-		if checkOrder(activeAd.Order, bItem.ReuploadOrder) || checkTimeDiff(adUploadedAt, bItem.ReuploadHours) {
-			// reupload ad = remove + upload
-
-			// remove ad
-			if err := c.RemoveAd(bItem.AdUploadedId); err != nil {
-				return err
-			}
-
-			// download s3 images
-			images := make([]io.Reader, len(bItem.AdImages))
-			for i, imgPath := range bItem.AdImages {
-				img, err := downloadS3Image(imgPath)
+		// if has AdUploadedId
+		if bItem.AdUploadedId != 0 {
+			// get active (uploaded) ad
+			activeAd, err := c.GetActiveAd(bItem.AdUploadedId)
+			// if ad uploaded
+			if err == nil {
+				adUploadedAtParsed, err := time.Parse(time.RFC3339, bItem.AdUploadedAt)
 				if err != nil {
 					return err
 				}
 
-				images[i] = img
-			}
+				// if ad not old
+				if activeAd.Order <= bItem.ReuploadOrder && time.Since(adUploadedAtParsed) <= time.Duration(bItem.ReuploadHours)*time.Hour {
+					// nothing to do
+					continue
+				} else {
+					// remove
+					if err := c.RemoveAd(bItem.AdUploadedId); err != nil {
+						return err
+					}
 
-			// upload ad
-			newUploadedId, err := c.UploadAd(&client.Ad{
-				Title:       bItem.AdTitle,
-				Description: bItem.AdDescription,
-				Price:       bItem.AdPrice,
-				CategoryId:  bItem.AdCategoryId,
-				Images:      images,
-			})
+					// TODO remove AdUploadedId from db
+				}
+			} else if err != client.ErrAdNotFound {
+				return err
+			}
+		}
+
+		// download s3 images
+		images := make([]io.Reader, len(bItem.AdImages))
+		for i, imgPath := range bItem.AdImages {
+
+			img, err := downloadS3Image(imgPath)
 			if err != nil {
 				return err
 			}
 
-			// update uploaded id
-			if err := updateUploadedId(bItem.AdTitle, newUploadedId); err != nil {
-				return err
-			}
+			images[i] = img
+		}
+
+		// upload ad
+		newUploadedId, err := c.UploadAd(&client.Ad{
+			Title:       bItem.AdTitle,
+			Description: bItem.AdDescription,
+			Price:       bItem.AdPrice,
+			CategoryId:  bItem.AdCategoryId,
+			Images:      images,
+		})
+		if err != nil {
+			return err
+		}
+
+		// update uploaded id
+		if err := updateUploadedId(bItem.AdTitle, newUploadedId); err != nil {
+			return err
 		}
 	}
 
 	return nil
 }
 
-func checkOrder(currOrder, allowedOrder int) bool {
-	return currOrder > allowedOrder
-}
-
-func checkTimeDiff(currUploadedAt time.Time, allowedHours int) bool {
-	return time.Since(currUploadedAt) > time.Duration(allowedHours)*time.Hour
-}
-
 // DYNAMODB
 
 func getBolhaItems() ([]BolhaItem, error) {
-	filt := expression.Name("AdUploadedId").GreaterThan(expression.Value(0))
-	expr, err := expression.NewBuilder().WithFilter(filt).Build()
-	if err != nil {
-		return nil, err
-	}
-
 	result, err := ddbc.Scan(&dynamodb.ScanInput{
-		ExpressionAttributeNames:  expr.Names(),
-		ExpressionAttributeValues: expr.Values(),
-		FilterExpression:          expr.Filter(),
-		TableName:                 aws.String(tableName),
+		TableName: aws.String(tableName),
 	})
 	if err != nil {
 		return nil, err
