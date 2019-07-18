@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-lambda-go/lambda"
@@ -45,7 +46,7 @@ type BolhaItem struct {
 	ReuploadOrder int
 }
 
-func Handler(ctx context.Context) error {
+func Handler(ctx context.Context) {
 	sess := session.Must(session.NewSession())
 
 	// initialize aws service clients
@@ -55,75 +56,93 @@ func Handler(ctx context.Context) error {
 	// get all items
 	bItems, err := getBolhaItems()
 	if err != nil {
-		return err
+		log.Error(err)
+		return
 	}
 
-	for _, bItem := range bItems {
-		// create new client
-		c, err := client.NewWithSessionId(bItem.UserSessionId)
-		if err != nil {
-			return err
-		}
+	var wg sync.WaitGroup
 
-		// if has AdUploadedId
-		if bItem.AdUploadedId != 0 {
-			// get active (uploaded) ad
-			activeAd, err := c.GetActiveAd(bItem.AdUploadedId)
-			// if ad uploaded
-			if err == nil {
-				adUploadedAtParsed, err := time.Parse(time.RFC3339, bItem.AdUploadedAt)
-				if err != nil {
-					return err
-				}
+	for _, bi := range bItems {
+		bItem := bi
 
-				// if ad not old
-				if activeAd.Order <= bItem.ReuploadOrder && time.Since(adUploadedAtParsed) <= time.Duration(bItem.ReuploadHours)*time.Hour {
-					// nothing to do
-					continue
-				} else {
-					// remove
-					if err := c.RemoveAd(bItem.AdUploadedId); err != nil {
-						return err
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			// create new client
+			c, err := client.NewWithSessionId(bItem.UserSessionId)
+			if err != nil {
+				log.Error(err)
+				return
+			}
+
+			// if has AdUploadedId
+			if bItem.AdUploadedId != 0 {
+				// get active (uploaded) ad
+				activeAd, err := c.GetActiveAd(bItem.AdUploadedId)
+				// if ad uploaded
+				if err == nil {
+					adUploadedAtParsed, err := time.Parse(time.RFC3339, bItem.AdUploadedAt)
+					if err != nil {
+						log.Error(err)
+						return
 					}
 
-					// TODO remove AdUploadedId from db
+					// if ad not old
+					if activeAd.Order <= bItem.ReuploadOrder && time.Since(adUploadedAtParsed) <= time.Duration(bItem.ReuploadHours)*time.Hour {
+						// nothing to do
+						return
+					} else {
+						// remove
+						if err := c.RemoveAd(bItem.AdUploadedId); err != nil {
+							log.Error(err)
+							return
+						}
+
+						// TODO remove AdUploadedId from db
+					}
+				} else if err != client.ErrAdNotFound {
+					log.Error(err)
+					return
 				}
-			} else if err != client.ErrAdNotFound {
-				return err
 			}
-		}
 
-		// download s3 images
-		images := make([]io.Reader, len(bItem.AdImages))
-		for i, imgPath := range bItem.AdImages {
+			// download s3 images
+			images := make([]io.Reader, len(bItem.AdImages))
+			for i, imgPath := range bItem.AdImages {
 
-			img, err := downloadS3Image(imgPath)
+				img, err := downloadS3Image(imgPath)
+				if err != nil {
+					log.Error(err)
+					return
+				}
+
+				images[i] = img
+			}
+
+			// upload ad
+			newUploadedId, err := c.UploadAd(&client.Ad{
+				Title:       bItem.AdTitle,
+				Description: bItem.AdDescription,
+				Price:       bItem.AdPrice,
+				CategoryId:  bItem.AdCategoryId,
+				Images:      images,
+			})
 			if err != nil {
-				return err
+				log.Error(err)
+				return
 			}
 
-			images[i] = img
-		}
-
-		// upload ad
-		newUploadedId, err := c.UploadAd(&client.Ad{
-			Title:       bItem.AdTitle,
-			Description: bItem.AdDescription,
-			Price:       bItem.AdPrice,
-			CategoryId:  bItem.AdCategoryId,
-			Images:      images,
-		})
-		if err != nil {
-			return err
-		}
-
-		// update uploaded id
-		if err := updateUploadedId(bItem.AdTitle, newUploadedId); err != nil {
-			return err
-		}
+			// update uploaded id
+			if err := updateUploadedId(bItem.AdTitle, newUploadedId); err != nil {
+				log.Error(err)
+				return
+			}
+		}()
 	}
 
-	return nil
+	wg.Wait()
 }
 
 // DYNAMODB
