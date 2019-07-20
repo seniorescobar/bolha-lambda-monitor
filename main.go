@@ -60,96 +60,17 @@ func Handler(ctx context.Context) error {
 	}
 
 	var wg sync.WaitGroup
-
 	errChan := make(chan error)
 
 	for _, bi := range bItems {
 		bItem := bi
 
 		wg.Add(1)
-
 		go func() {
 			defer wg.Done()
-
-			// create new client
-			c, err := client.NewWithSessionId(bItem.UserSessionId)
-			if err != nil {
+			if err := processItem(&bItem); err != nil {
 				errChan <- err
 				return
-			}
-
-			// upload if not yet uploaded
-			if bItem.AdUploadedId == 0 {
-				newUploadedId, err := uploadAd(c, bItem)
-				if err != nil {
-					errChan <- err
-					return
-				}
-
-				// update uploaded id
-				if err := updateUploadedId(bItem.AdTitle, newUploadedId); err != nil {
-					errChan <- err
-					return
-				}
-
-				return
-			}
-
-			// get active (uploaded) ad
-			activeAd, err := c.GetActiveAd(bItem.AdUploadedId)
-			if err != nil {
-				errChan <- err
-				return
-			}
-
-			adUploadedAtParsed, err := time.Parse(time.RFC3339, bItem.AdUploadedAt)
-			if err != nil {
-				errChan <- err
-				return
-			}
-
-			// if ad not old
-			if activeAd.Order > bItem.ReuploadOrder || time.Since(adUploadedAtParsed) > time.Duration(bItem.ReuploadHours)*time.Hour {
-				removeChan := make(chan struct{}, 1)
-				uploadChan := make(chan int64, 1)
-				errChan1 := make(chan error, 2)
-
-				// remove
-				go func() {
-					if err := c.RemoveAd(bItem.AdUploadedId); err != nil {
-						errChan1 <- err
-						return
-					}
-					removeChan <- struct{}{}
-				}()
-
-				// upload
-				go func() {
-					newUploadedId, err := uploadAd(c, bItem)
-					if err != nil {
-						errChan1 <- err
-						return
-					}
-					uploadChan <- newUploadedId
-				}()
-
-				go func() {
-					<-removeChan
-					newUploadedId := <-uploadChan
-
-					// update uploaded id
-					if err := updateUploadedId(bItem.AdTitle, newUploadedId); err != nil {
-						errChan1 <- err
-						return
-					}
-
-					close(errChan1)
-				}()
-
-				for err := range errChan1 {
-					errChan <- err
-					return
-				}
 			}
 		}()
 	}
@@ -167,7 +88,86 @@ func Handler(ctx context.Context) error {
 }
 
 // HELPERS
-func uploadAd(c *client.Client, bItem BolhaItem) (int64, error) {
+func processItem(bItem *BolhaItem) error {
+	// create new client
+	c, err := client.NewWithSessionId(bItem.UserSessionId)
+	if err != nil {
+		return err
+	}
+
+	// upload if not yet uploaded
+	if bItem.AdUploadedId == 0 {
+		newUploadedId, err := uploadAd(c, bItem)
+		if err != nil {
+			return err
+		}
+
+		// update uploaded id
+		if err := updateUploadedId(bItem.AdTitle, newUploadedId); err != nil {
+			return err
+		}
+
+		return nil
+	}
+
+	// get active (uploaded) ad
+	activeAd, err := c.GetActiveAd(bItem.AdUploadedId)
+	if err != nil {
+		return err
+	}
+
+	adUploadedAtParsed, err := time.Parse(time.RFC3339, bItem.AdUploadedAt)
+	if err != nil {
+		return err
+	}
+
+	// if ad not old
+	if activeAd.Order > bItem.ReuploadOrder || time.Since(adUploadedAtParsed) > time.Duration(bItem.ReuploadHours)*time.Hour {
+		removeChan := make(chan struct{}, 1)
+		uploadChan := make(chan int64, 1)
+		errChan := make(chan error, 2)
+
+		// remove
+		go func() {
+			if err := c.RemoveAd(bItem.AdUploadedId); err != nil {
+				errChan <- err
+				return
+			}
+			removeChan <- struct{}{}
+		}()
+
+		// upload
+		go func() {
+			newUploadedId, err := uploadAd(c, bItem)
+			if err != nil {
+				errChan <- err
+				return
+			}
+			uploadChan <- newUploadedId
+		}()
+
+		go func() {
+			<-removeChan
+			newUploadedId := <-uploadChan
+
+			// update uploaded id
+			if err := updateUploadedId(bItem.AdTitle, newUploadedId); err != nil {
+				errChan <- err
+				return
+			}
+
+			close(errChan)
+		}()
+
+		for err := range errChan {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func uploadAd(c *client.Client, bItem *BolhaItem) (int64, error) {
 	// download s3 images
 	s3Images, err := downloadS3Images(bItem.AdImages)
 	if err != nil {
