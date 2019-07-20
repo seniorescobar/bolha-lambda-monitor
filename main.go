@@ -46,7 +46,7 @@ type BolhaItem struct {
 	ReuploadOrder int
 }
 
-func Handler(ctx context.Context) {
+func Handler(ctx context.Context) error {
 	sess := session.Must(session.NewSession())
 
 	// initialize aws service clients
@@ -56,11 +56,12 @@ func Handler(ctx context.Context) {
 	// get all items
 	bItems, err := getBolhaItems()
 	if err != nil {
-		log.Error(err)
-		return
+		return err
 	}
 
 	var wg sync.WaitGroup
+
+	errChan := make(chan error)
 
 	for _, bi := range bItems {
 		bItem := bi
@@ -73,72 +74,116 @@ func Handler(ctx context.Context) {
 			// create new client
 			c, err := client.NewWithSessionId(bItem.UserSessionId)
 			if err != nil {
-				log.Error(err)
+				errChan <- err
 				return
 			}
 
-			// if has AdUploadedId
-			if bItem.AdUploadedId != 0 {
-				// get active (uploaded) ad
-				activeAd, err := c.GetActiveAd(bItem.AdUploadedId)
-				// if ad uploaded
-				if err == nil {
-					adUploadedAtParsed, err := time.Parse(time.RFC3339, bItem.AdUploadedAt)
-					if err != nil {
-						log.Error(err)
-						return
-					}
-
-					// if ad not old
-					if activeAd.Order <= bItem.ReuploadOrder && time.Since(adUploadedAtParsed) <= time.Duration(bItem.ReuploadHours)*time.Hour {
-						// nothing to do
-						return
-					} else {
-						// remove
-						if err := c.RemoveAd(bItem.AdUploadedId); err != nil {
-							log.Error(err)
-							return
-						}
-
-						// TODO remove AdUploadedId from db
-					}
-				} else if err != client.ErrAdNotFound {
-					log.Error(err)
+			// upload if not yet uploaded
+			if bItem.AdUploadedId == 0 {
+				newUploadedId, err := uploadAd(c, bItem)
+				if err != nil {
+					errChan <- err
 					return
 				}
-			}
 
-			// download s3 images
-			s3Images, err := downloadS3Images(bItem.AdImages)
-			if err != nil {
+				// update uploaded id
+				if err := updateUploadedId(bItem.AdTitle, newUploadedId); err != nil {
+					errChan <- err
+					return
+				}
 
-			}
-
-			// upload ad
-			newUploadedId, err := c.UploadAd(&client.Ad{
-				Title:       bItem.AdTitle,
-				Description: bItem.AdDescription,
-				Price:       bItem.AdPrice,
-				CategoryId:  bItem.AdCategoryId,
-				Images:      s3Images,
-			})
-			if err != nil {
-				log.Error(err)
 				return
 			}
 
-			// update uploaded id
-			if err := updateUploadedId(bItem.AdTitle, newUploadedId); err != nil {
-				log.Error(err)
+			// get active (uploaded) ad
+			activeAd, err := c.GetActiveAd(bItem.AdUploadedId)
+			if err != nil {
+				errChan <- err
 				return
+			}
+
+			adUploadedAtParsed, err := time.Parse(time.RFC3339, bItem.AdUploadedAt)
+			if err != nil {
+				errChan <- err
+				return
+			}
+
+			// if ad not old
+			if activeAd.Order > bItem.ReuploadOrder || time.Since(adUploadedAtParsed) > time.Duration(bItem.ReuploadHours)*time.Hour {
+				removeChan := make(chan struct{}, 1)
+				uploadChan := make(chan int64, 1)
+				errChan1 := make(chan error, 2)
+
+				// remove
+				go func() {
+					if err := c.RemoveAd(bItem.AdUploadedId); err != nil {
+						errChan1 <- err
+						return
+					}
+					removeChan <- struct{}{}
+				}()
+
+				// upload
+				go func() {
+					newUploadedId, err := uploadAd(c, bItem)
+					if err != nil {
+						errChan1 <- err
+						return
+					}
+					uploadChan <- newUploadedId
+				}()
+
+				go func() {
+					<-removeChan
+					newUploadedId := <-uploadChan
+
+					// update uploaded id
+					if err := updateUploadedId(bItem.AdTitle, newUploadedId); err != nil {
+						errChan1 <- err
+						return
+					}
+
+					close(errChan1)
+				}()
+
+				for err := range errChan1 {
+					errChan <- err
+					return
+				}
 			}
 		}()
 	}
 
-	wg.Wait()
+	go func() {
+		wg.Wait()
+		close(errChan)
+	}()
+
+	for err := range errChan {
+		return err
+	}
+
+	return nil
 }
 
 // HELPERS
+func uploadAd(c *client.Client, bItem BolhaItem) (int64, error) {
+	// download s3 images
+	s3Images, err := downloadS3Images(bItem.AdImages)
+	if err != nil {
+		return 0, err
+	}
+
+	// upload ad
+	return c.UploadAd(&client.Ad{
+		Title:       bItem.AdTitle,
+		Description: bItem.AdDescription,
+		Price:       bItem.AdPrice,
+		CategoryId:  bItem.AdCategoryId,
+		Images:      s3Images,
+	})
+}
+
 func downloadS3Images(images []string) ([]io.Reader, error) {
 	// do not use img chan because images need to maintain initial order
 	var wg sync.WaitGroup
