@@ -109,16 +109,9 @@ func Handler(ctx context.Context) {
 			}
 
 			// download s3 images
-			images := make([]io.Reader, len(bItem.AdImages))
-			for i, imgPath := range bItem.AdImages {
+			s3Images, err := downloadS3Images(bItem.AdImages)
+			if err != nil {
 
-				img, err := downloadS3Image(imgPath)
-				if err != nil {
-					log.Error(err)
-					return
-				}
-
-				images[i] = img
 			}
 
 			// upload ad
@@ -127,7 +120,7 @@ func Handler(ctx context.Context) {
 				Description: bItem.AdDescription,
 				Price:       bItem.AdPrice,
 				CategoryId:  bItem.AdCategoryId,
-				Images:      images,
+				Images:      s3Images,
 			})
 			if err != nil {
 				log.Error(err)
@@ -143,6 +136,44 @@ func Handler(ctx context.Context) {
 	}
 
 	wg.Wait()
+}
+
+// HELPERS
+func downloadS3Images(images []string) ([]io.Reader, error) {
+	// do not use img chan because images need to maintain initial order
+	var wg sync.WaitGroup
+
+	errChan := make(chan error, len(images))
+
+	s3Images := make([]io.Reader, len(images))
+	for i, imgPath := range images {
+		i1, imgPath1 := i, imgPath
+
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			img, err := downloadS3Image(imgPath1)
+			if err != nil {
+				errChan <- err
+				return
+			}
+
+			s3Images[i1] = img
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(errChan)
+	}()
+
+	for err := range errChan {
+		return nil, err
+	}
+
+	return s3Images, nil
 }
 
 // DYNAMODB
