@@ -123,43 +123,44 @@ func processItem(bItem *BolhaItem) error {
 
 	// if ad not old
 	if activeAd.Order > bItem.ReuploadOrder || time.Since(adUploadedAtParsed) > time.Duration(bItem.ReuploadHours)*time.Hour {
-		removeChan := make(chan struct{}, 1)
-		uploadChan := make(chan int64, 1)
+		var wg sync.WaitGroup
 		errChan := make(chan error, 2)
+
+		wg.Add(2)
+
+		var newUploadedId int64
 
 		// remove
 		go func() {
+			defer wg.Done()
 			if err := c.RemoveAd(bItem.AdUploadedId); err != nil {
 				errChan <- err
 				return
 			}
-			removeChan <- struct{}{}
 		}()
 
 		// upload
 		go func() {
-			newUploadedId, err := uploadAd(c, bItem)
+			defer wg.Done()
+			id, err := uploadAd(c, bItem)
 			if err != nil {
 				errChan <- err
 				return
 			}
-			uploadChan <- newUploadedId
+			newUploadedId = id
 		}()
 
 		go func() {
-			<-removeChan
-			newUploadedId := <-uploadChan
-
-			// update uploaded id
-			if err := updateUploadedId(bItem.AdTitle, newUploadedId); err != nil {
-				errChan <- err
-				return
-			}
-
+			wg.Wait()
 			close(errChan)
 		}()
 
 		for err := range errChan {
+			return err
+		}
+
+		// update uploaded id
+		if err := updateUploadedId(bItem.AdTitle, newUploadedId); err != nil {
 			return err
 		}
 	}
