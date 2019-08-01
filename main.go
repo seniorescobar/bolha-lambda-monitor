@@ -89,6 +89,8 @@ func Handler(ctx context.Context) error {
 
 // HELPERS
 func processItem(bItem *BolhaItem) error {
+	log.Info("processing item %s...", bItem)
+
 	// create new client
 	c, err := client.NewWithSessionId(bItem.UserSessionId)
 	if err != nil {
@@ -111,10 +113,12 @@ func processItem(bItem *BolhaItem) error {
 	}
 
 	// get active (uploaded) ad
+	log.WithField("AdUploadedId", bItem.AdUploadedId).Info("getting active ad...")
 	activeAd, err := c.GetActiveAd(bItem.AdUploadedId)
 	if err != nil {
 		return err
 	}
+	log.WithField("activeAd", activeAd).Info("active ad")
 
 	adUploadedAtParsed, err := time.Parse(time.RFC3339, bItem.AdUploadedAt)
 	if err != nil {
@@ -133,10 +137,12 @@ func processItem(bItem *BolhaItem) error {
 		// remove
 		go func() {
 			defer wg.Done()
+			log.WithField("AdUploadedId", bItem.AdUploadedId).Info("removing ad...")
 			if err := c.RemoveAd(bItem.AdUploadedId); err != nil {
 				errChan <- err
 				return
 			}
+			log.WithField("AdUploadedId", bItem.AdUploadedId).Info("ad removed")
 		}()
 
 		// upload
@@ -169,6 +175,8 @@ func processItem(bItem *BolhaItem) error {
 }
 
 func uploadAd(c *client.Client, bItem *BolhaItem) (int64, error) {
+	log.Info("uploading ad...")
+
 	// download s3 images
 	s3Images, err := downloadS3Images(bItem.AdImages)
 	if err != nil {
@@ -186,6 +194,8 @@ func uploadAd(c *client.Client, bItem *BolhaItem) (int64, error) {
 }
 
 func downloadS3Images(images []string) ([]io.Reader, error) {
+	log.WithField("images", images).Info("downloading s3 images...")
+
 	// do not use img chan because images need to maintain initial order
 	var wg sync.WaitGroup
 
@@ -225,6 +235,8 @@ func downloadS3Images(images []string) ([]io.Reader, error) {
 // DYNAMODB
 
 func getBolhaItems() ([]BolhaItem, error) {
+	log.Info("getting bolha items...")
+
 	result, err := ddbc.Scan(&dynamodb.ScanInput{
 		TableName: aws.String(tableName),
 	})
@@ -237,10 +249,14 @@ func getBolhaItems() ([]BolhaItem, error) {
 		return nil, err
 	}
 
+	log.WithField("bItems", bItems).Info("bolha items")
+
 	return bItems, nil
 }
 
 func updateUploadedId(adTitle string, adUploadedId int64) error {
+	log.Info("updating uploaded id...")
+
 	_, err := ddbc.UpdateItem(&dynamodb.UpdateItemInput{
 		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
 			":uploadedId": {N: aws.String(strconv.FormatInt(adUploadedId, 10))},
@@ -251,13 +267,15 @@ func updateUploadedId(adTitle string, adUploadedId int64) error {
 		TableName:        aws.String(tableName),
 	})
 
+	log.Info("uploaded id updated")
+
 	return err
 }
 
 // S3
 
 func downloadS3Image(imgKey string) (io.Reader, error) {
-	log.WithField("imgKey", imgKey).Info("downloading image from s3")
+	log.WithField("imgKey", imgKey).Info("downloading s3 image...")
 
 	buff := new(aws.WriteAtBuffer)
 
@@ -270,6 +288,8 @@ func downloadS3Image(imgKey string) (io.Reader, error) {
 	}
 
 	imgBytes := buff.Bytes()
+
+	log.WithField("imgKey", imgKey).Info("s3 image downloaded")
 
 	return bytes.NewReader(imgBytes), nil
 }
